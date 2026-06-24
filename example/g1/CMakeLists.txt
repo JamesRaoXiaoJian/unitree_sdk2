@@ -51,3 +51,15 @@ target_link_libraries(g1d_height_control unitree_sdk2)
 
 add_executable(g1_hand_sdk_example high_level/g1_hand_sdk_example.cpp)
 target_link_libraries(g1_hand_sdk_example unitree_sdk2)
+
+add_executable(g1_csv_replay_example mujoco/g1_csv_replay_example.cpp)
+target_link_libraries(g1_csv_replay_example unitree_sdk2)
+
+add_executable(test_sim_send mujoco/test_sim_send.cpp)
+target_link_libraries(test_sim_send unitree_sdk2)
+
+add_executable(test_connection mujoco/test_connection.cpp)
+target_link_libraries(test_connection unitree_sdk2)
+
+# MuJoCo simulation bridge (optional, requires mujoco C library)
+add_subdirectory(mujoco)

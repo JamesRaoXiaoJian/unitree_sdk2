@@ -1,0 +1,12 @@
+# Build
+build/
+*.o
+*.so
+
+# Python
+__pycache__/
+*.pyc
+*.npy
+
+# MuJoCo logs
+MUJOCO_LOG.TXT
