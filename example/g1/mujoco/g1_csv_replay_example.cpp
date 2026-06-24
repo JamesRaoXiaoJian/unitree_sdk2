@@ -112,8 +112,10 @@ int main(int argc, char const* argv[]) {
 
     std::string net = argv[1];
     std::string csv_path = argv[2];
-    float fps = 50.0f;  // Official example uses 50 Hz
-    if (argc > 3) { try { fps = std::stof(argv[3]); } catch (...) {} }
+    float fps = 60.0f;  // Default 60 Hz to match CSV data rate
+    for (int i = 3; i < argc; i++) {
+        try { fps = std::stof(argv[i]); } catch (...) {}
+    }
 
     auto frames = LoadCsv(csv_path);
     if (frames.empty()) return 1;
