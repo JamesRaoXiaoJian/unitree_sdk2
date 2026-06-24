@@ -1,20 +1,24 @@
-// CSV Joint Motion Replay for Unitree G1 (Real Robot)
-// ====================================================
+// CSV Joint Motion Replay for Unitree G1 — Arm SDK Mode
+// ======================================================
 //
-// Reads CSV joint data and replays on the real G1 robot via SDK.
+// Sends upper-body keyframes to the robot via `rt/arm_sdk` topic.
+// Uses weight mechanism: no PASSIVE mode required, works from any state.
+//
+// Formula: Motor_real = weight * User_Cmd + (1 - weight) * BuiltIn_Cmd
 //
 // Flow:
-//   1. Connect to robot via DDS
-//   2. Wait for state data
-//   3. Switch to UserCtrl
+//   1. Connect DDS
+//   2. Read current joint positions
+//   3. weight 0→1 (engage user control)
 //   4. Smooth transition to CSV first frame
-//   5. Replay all frames at target FPS
-//   6. Switch back to InternalCtrl
+//   5. Replay CSV keyframes at 50 Hz
+//   6. weight 1→0 (release to built-in control)
 //
 // Usage:
-//   ./g1_csv_replay_example <network_interface> <csv_path> [fps] [--hold-lower]
-//   ./g1_csv_replay_example eth0 motion.csv 60 --hold-lower
+//   ./g1_csv_replay_example <net> <csv> [fps]
+//   ./g1_csv_replay_example eth0 motion.csv 50
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <fstream>
@@ -29,26 +33,45 @@
 #include <unitree/robot/channel/channel_factory.hpp>
 #include <unitree/robot/channel/channel_publisher.hpp>
 #include <unitree/robot/channel/channel_subscriber.hpp>
-#include <unitree/robot/g1/loco/g1_loco_client.hpp>
 
-static const std::string kTopicUserCtrl = "rt/user_lowcmd";
+static const std::string kTopicArmSDK = "rt/arm_sdk";
 static const std::string kTopicState = "rt/lowstate";
-static constexpr int kNumJoints = 29;
 
-// Default standing pose (from XML keyframe)
-static const std::array<float, kNumJoints> kDefaultStanding = {
-    -0.2f, 0.0f, 0.0f, 0.4f, -0.2f, 0.0f,    // left leg
-    -0.2f, 0.0f, 0.0f, 0.4f, -0.2f, 0.0f,    // right leg
-     0.0f, 0.0f, 0.0f,                         // waist
-     0.0f, 0.0f, 0.0f, 0.4f, 0.0f, 1.2f, 0.0f,  // left arm
-     0.0f, -0.4f, 0.0f, 1.2f, 0.0f, 0.0f, 0.0f  // right arm
+// Upper-body joint indices (arms + waist = 17 DOF)
+enum ArmJointIndex {
+    kLeftShoulderPitch = 15,
+    kLeftShoulderRoll = 16,
+    kLeftShoulderYaw = 17,
+    kLeftElbow = 18,
+    kLeftWristRoll = 19,
+    kLeftWristPitch = 20,
+    kLeftWristYaw = 21,
+    kRightShoulderPitch = 22,
+    kRightShoulderRoll = 23,
+    kRightShoulderYaw = 24,
+    kRightElbow = 25,
+    kRightWristRoll = 26,
+    kRightWristPitch = 27,
+    kRightWristYaw = 28,
+    kWaistYaw = 12,
+    kWaistRoll = 13,
+    kWaistPitch = 14,
+    kNotUsedJoint = 29,  // Used to send weight
+};
+
+// Joint order for arm_sdk (17 joints)
+static const std::array<int, 17> kArmJoints = {
+    15, 16, 17, 18, 19, 20, 21,  // left arm
+    22, 23, 24, 25, 26, 27, 28,  // right arm
+    12, 13, 14,                   // waist
 };
 
 static constexpr float kDefaultKp = 60.0f;
 static constexpr float kDefaultKd = 1.5f;
+static constexpr float kMaxJointVelocity = 0.5f;  // rad/s
 
 struct CsvFrame {
-    std::array<float, kNumJoints> joints;
+    std::array<float, 29> joints;  // Full 29 DOF from CSV
 };
 
 std::vector<CsvFrame> LoadCsv(const std::string& path) {
@@ -60,11 +83,8 @@ std::vector<CsvFrame> LoadCsv(const std::string& path) {
     }
 
     std::string line;
-    int line_num = 0;
     while (std::getline(file, line)) {
-        line_num++;
         if (line.empty()) continue;
-
         std::vector<float> values;
         std::stringstream ss(line);
         std::string cell;
@@ -72,50 +92,39 @@ std::vector<CsvFrame> LoadCsv(const std::string& path) {
             try { values.push_back(std::stof(cell)); }
             catch (...) { break; }
         }
-
         if (values.size() != 36) continue;
 
         CsvFrame frame;
-        for (int i = 0; i < kNumJoints; i++) {
-            frame.joints[i] = values[7 + i];
-        }
+        for (int i = 0; i < 29; i++) frame.joints[i] = values[7 + i];
         frames.push_back(frame);
     }
 
-    std::cout << "Loaded " << frames.size() << " frames (" << frames.size() / 60.0f << "s)" << std::endl;
+    std::cout << "Loaded " << frames.size() << " frames ("
+              << frames.size() / 60.0f << "s)" << std::endl;
     return frames;
 }
 
 int main(int argc, char const* argv[]) {
     if (argc < 3) {
-        std::cout << "Usage: " << argv[0] << " <net> <csv> [fps] [--hold-lower]" << std::endl;
+        std::cout << "Usage: " << argv[0] << " <net> <csv> [fps]" << std::endl;
         return 1;
     }
 
     std::string net = argv[1];
     std::string csv_path = argv[2];
-    float fps = 60.0f;
-    bool hold_lower = false;
+    float fps = 50.0f;  // Official example uses 50 Hz
+    if (argc > 3) { try { fps = std::stof(argv[3]); } catch (...) {} }
 
-    for (int i = 3; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--hold-lower") hold_lower = true;
-        else { try { fps = std::stof(arg); } catch (...) {} }
-    }
-
-    // Load CSV
     auto frames = LoadCsv(csv_path);
     if (frames.empty()) return 1;
 
     // ---- DDS Init ----
-    std::cout << "Connecting to robot via " << net << "..." << std::endl;
+    std::cout << "Connecting via " << net << "..." << std::endl;
     unitree::robot::ChannelFactory::Instance()->Init(0, net);
 
-    // Publisher: send joint commands
-    auto cmd_pub = std::make_shared<unitree::robot::ChannelPublisher<unitree_hg::msg::dds_::LowCmd_>>(kTopicUserCtrl);
-    cmd_pub->InitChannel();
+    auto arm_pub = std::make_shared<unitree::robot::ChannelPublisher<unitree_hg::msg::dds_::LowCmd_>>(kTopicArmSDK);
+    arm_pub->InitChannel();
 
-    // Subscriber: read robot state
     unitree_hg::msg::dds_::LowState_ state_msg;
     std::atomic<bool> state_received{false};
     auto state_sub = std::make_shared<unitree::robot::ChannelSubscriber<unitree_hg::msg::dds_::LowState_>>(kTopicState);
@@ -125,82 +134,91 @@ int main(int argc, char const* argv[]) {
         state_received = true;
     }, 1);
 
-    // Wait for state data
+    // Wait for state
     std::cout << "Waiting for robot state..." << std::endl;
-    auto wait_start = std::chrono::steady_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
     while (!state_received) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        if (std::chrono::duration<float>(std::chrono::steady_clock::now() - wait_start).count() > 5.0f) {
-            std::cerr << "ERROR: No state data received after 5s. Check connection." << std::endl;
+        if (std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count() > 5.0f) {
+            std::cerr << "ERROR: No state after 5s." << std::endl;
             return 1;
         }
     }
-    std::cout << "State received. Joints: ";
-    for (int i = 0; i < 6; i++) std::cout << state_msg.motor_state().at(i).q() << " ";
-    std::cout << "..." << std::endl;
+    std::cout << "Connected." << std::endl;
 
-    // ---- FSM Control ----
-    unitree::robot::g1::LocoClient client;
-    client.Init();
-    client.SetTimeout(5.0f);
-
-    int fsm_id;
-    client.GetFsmId(fsm_id);
-    std::cout << "FSM id: " << fsm_id;
-    if (fsm_id != 1) {
-        std::cout << " (NOT PASSIVE - please switch robot to PASSIVE mode)" << std::endl;
-        return 1;
-    }
-    std::cout << " (PASSIVE - OK)" << std::endl;
-
-    // Read current joint positions
-    std::array<float, kNumJoints> current_jpos{};
-    for (int i = 0; i < kNumJoints; i++) {
-        current_jpos[i] = state_msg.motor_state().at(i).q();
+    // ---- Read current positions ----
+    std::array<float, 17> current_jpos{};
+    for (int i = 0; i < 17; i++) {
+        current_jpos[i] = state_msg.motor_state().at(kArmJoints[i]).q();
     }
 
-    // ---- Phase 1: Switch to UserCtrl ----
-    std::cout << "\n=== Phase 1: Switch to UserCtrl ===" << std::endl;
-
-    // Send initial zero command
+    // ---- Parameters ----
     unitree_hg::msg::dds_::LowCmd_ cmd_msg;
-    for (int j = 0; j < kNumJoints; j++) {
-        cmd_msg.motor_cmd().at(j).q(current_jpos[j]);
-        cmd_msg.motor_cmd().at(j).dq(0);
-        cmd_msg.motor_cmd().at(j).kp(0);
-        cmd_msg.motor_cmd().at(j).kd(kDefaultKd);
-        cmd_msg.motor_cmd().at(j).tau(0);
+    float control_dt = 1.0f / fps;
+    float max_joint_delta = kMaxJointVelocity / fps;
+    auto sleep_time = std::chrono::microseconds(static_cast<int>(control_dt * 1000000));
+
+    // Weight engage/disengage
+    float weight = 0.0f;
+    float weight_rate = 0.2f;           // weight change per second
+    float delta_weight = weight_rate * control_dt;
+
+    // ---- Phase 1: Engage weight 0→1 ----
+    std::cout << "=== Phase 1: Engage (weight 0→1) ===" << std::endl;
+    float engage_time = 1.0f;
+    int engage_steps = static_cast<int>(engage_time / control_dt);
+
+    for (int i = 0; i < engage_steps; i++) {
+        weight = std::clamp(weight + delta_weight, 0.0f, 1.0f);
+        cmd_msg.motor_cmd().at(kNotUsedJoint).q(weight);
+
+        // Send current positions during engage (no movement)
+        for (int j = 0; j < 17; j++) {
+            cmd_msg.motor_cmd().at(kArmJoints[j]).q(current_jpos[j]);
+            cmd_msg.motor_cmd().at(kArmJoints[j]).dq(0);
+            cmd_msg.motor_cmd().at(kArmJoints[j]).kp(kDefaultKp);
+            cmd_msg.motor_cmd().at(kArmJoints[j]).kd(kDefaultKd);
+            cmd_msg.motor_cmd().at(kArmJoints[j]).tau(0);
+        }
+        arm_pub->Write(cmd_msg);
+        std::this_thread::sleep_for(sleep_time);
     }
-    cmd_pub->Write(cmd_msg);
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::cout << "  weight = " << weight << std::endl;
 
-    client.SwitchToUserCtrl();
-    std::cout << "UserCtrl active." << std::endl;
-
-    // ---- Phase 2: Smooth transition to first CSV frame ----
+    // ---- Phase 2: Transition to CSV first frame ----
     std::cout << "=== Phase 2: Transition to initial pose ===" << std::endl;
 
-    std::array<float, kNumJoints> first_target{};
-    for (int j = 0; j < kNumJoints; j++) {
-        first_target[j] = (hold_lower && j < 15) ? kDefaultStanding[j] : frames[0].joints[j];
+    // Extract upper-body targets from CSV frame 0
+    std::array<float, 17> first_target{};
+    for (int i = 0; i < 17; i++) {
+        first_target[i] = frames[0].joints[kArmJoints[i] - 12 + 12];
+        // kArmJoints[i] is the SDK joint index (12-28)
+        // CSV joints[kArmJoints[i]] is the corresponding CSV value
+    }
+    // Simpler: just use the SDK index directly
+    for (int i = 0; i < 17; i++) {
+        first_target[i] = frames[0].joints[kArmJoints[i]];
     }
 
-    auto control_dt = std::chrono::microseconds(static_cast<int>(1000000.0f / fps));
+    std::array<float, 17> cmd_pos = current_jpos;
     float transition_time = 2.0f;
-    int transition_steps = static_cast<int>(transition_time * fps);
+    int transition_steps = static_cast<int>(transition_time / control_dt);
 
     for (int i = 0; i < transition_steps; i++) {
-        float phase = static_cast<float>(i) / transition_steps;
-        for (int j = 0; j < kNumJoints; j++) {
-            float des = current_jpos[j] * (1.0f - phase) + first_target[j] * phase;
-            cmd_msg.motor_cmd().at(j).q(des);
-            cmd_msg.motor_cmd().at(j).dq(0);
-            cmd_msg.motor_cmd().at(j).kp(kDefaultKp);
-            cmd_msg.motor_cmd().at(j).kd(kDefaultKd);
-            cmd_msg.motor_cmd().at(j).tau(0);
+        weight = std::clamp(weight + delta_weight, 0.0f, 1.0f);
+        cmd_msg.motor_cmd().at(kNotUsedJoint).q(weight);
+
+        for (int j = 0; j < 17; j++) {
+            float delta = std::clamp(first_target[j] - cmd_pos[j], -max_joint_delta, max_joint_delta);
+            cmd_pos[j] += delta;
+            cmd_msg.motor_cmd().at(kArmJoints[j]).q(cmd_pos[j]);
+            cmd_msg.motor_cmd().at(kArmJoints[j]).dq(0);
+            cmd_msg.motor_cmd().at(kArmJoints[j]).kp(kDefaultKp);
+            cmd_msg.motor_cmd().at(kArmJoints[j]).kd(kDefaultKd);
+            cmd_msg.motor_cmd().at(kArmJoints[j]).tau(0);
         }
-        cmd_pub->Write(cmd_msg);
-        std::this_thread::sleep_for(control_dt);
+        arm_pub->Write(cmd_msg);
+        std::this_thread::sleep_for(sleep_time);
     }
     std::cout << "Transition complete." << std::endl;
 
@@ -211,34 +229,52 @@ int main(int argc, char const* argv[]) {
     for (size_t fi = 0; fi < frames.size(); fi++) {
         auto frame_start = std::chrono::steady_clock::now();
 
-        for (int j = 0; j < kNumJoints; j++) {
-            float target = (hold_lower && j < 15) ? kDefaultStanding[j] : frames[fi].joints[j];
-            cmd_msg.motor_cmd().at(j).q(target);
-            cmd_msg.motor_cmd().at(j).dq(0);
-            cmd_msg.motor_cmd().at(j).kp(kDefaultKp);
-            cmd_msg.motor_cmd().at(j).kd(kDefaultKd);
-            cmd_msg.motor_cmd().at(j).tau(0);
+        cmd_msg.motor_cmd().at(kNotUsedJoint).q(weight);
+
+        for (int j = 0; j < 17; j++) {
+            float target = frames[fi].joints[kArmJoints[j]];
+            float delta = std::clamp(target - cmd_pos[j], -max_joint_delta, max_joint_delta);
+            cmd_pos[j] += delta;
+
+            cmd_msg.motor_cmd().at(kArmJoints[j]).q(cmd_pos[j]);
+            cmd_msg.motor_cmd().at(kArmJoints[j]).dq(0);
+            cmd_msg.motor_cmd().at(kArmJoints[j]).kp(kDefaultKp);
+            cmd_msg.motor_cmd().at(kArmJoints[j]).kd(kDefaultKd);
+            cmd_msg.motor_cmd().at(kArmJoints[j]).tau(0);
         }
-        cmd_pub->Write(cmd_msg);
+        arm_pub->Write(cmd_msg);
 
         if (fi % 60 == 0) {
             float t = std::chrono::duration<float>(
                 std::chrono::steady_clock::now() - replay_start).count();
-            std::cout << "  frame " << fi << "/" << frames.size() << " t=" << t << "s" << std::endl;
+            std::cout << "  frame " << fi << "/" << frames.size()
+                      << " t=" << t << "s" << std::endl;
         }
 
         auto elapsed = std::chrono::steady_clock::now() - frame_start;
-        if (elapsed < control_dt) std::this_thread::sleep_for(control_dt - elapsed);
+        if (elapsed < sleep_time) std::this_thread::sleep_for(sleep_time - elapsed);
     }
 
     float total = std::chrono::duration<float>(
         std::chrono::steady_clock::now() - replay_start).count();
     std::cout << "Replay done: " << frames.size() << " frames in " << total << "s" << std::endl;
 
-    // ---- Phase 4: Return control ----
-    std::cout << "=== Phase 4: Returning to InternalCtrl ===" << std::endl;
-    client.SwitchToInternalCtrl(unitree::robot::g1::InternalFsmMode::LAST);
-    std::cout << "Done." << std::endl;
+    // ---- Phase 4: Disengage weight 1→0 ----
+    std::cout << "=== Phase 4: Disengage (weight 1→0) ===" << std::endl;
+    float disengage_time = 2.0f;
+    int disengage_steps = static_cast<int>(disengage_time / control_dt);
 
+    for (int i = 0; i < disengage_steps; i++) {
+        weight = std::clamp(weight - delta_weight, 0.0f, 1.0f);
+        cmd_msg.motor_cmd().at(kNotUsedJoint).q(weight);
+        arm_pub->Write(cmd_msg);
+        std::this_thread::sleep_for(sleep_time);
+    }
+
+    // Final zero weight
+    cmd_msg.motor_cmd().at(kNotUsedJoint).q(0);
+    arm_pub->Write(cmd_msg);
+
+    std::cout << "Done. Robot returned to built-in control." << std::endl;
     return 0;
 }
