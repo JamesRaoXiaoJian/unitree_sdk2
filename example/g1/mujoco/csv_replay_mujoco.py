@@ -237,6 +237,7 @@ def main():
         viewer.cam.lookat[2] = 0.8
         viewer.cam.distance = 2.5
         viewer.cam.elevation = -10
+        viewer.cam.azimuth = 180  # Face front
 
         paused = False
         last_time = time.time()
